@@ -2,26 +2,26 @@ module SyntheticControls
 
 using Distributions
 using Optim
-using StatsBase
+# using StatsBase
 using ProgressMeter
 using StatsPlots, RecipesBase
 
 """
-    SyntheticControlWeights{M<:AbstractMatrix}
+    Weightings{M<:AbstractMatrix}
 
 Wrapper for a matrix of type `M`. Rows correspond to candidate controls, columns correspond to synthetic controls (and therefore sum to one).
 """
-struct SyntheticControlWeights{M<:AbstractMatrix}
+struct Weightings{M<:AbstractMatrix}
     w::M
-    function SyntheticControlWeights(w::M) where M
+    function Weightings(w::M) where M
         w0 = sum(w, dims=1)
         all(>=(0), w) || error("∃ at least one negative weight in at least one synthetic control.")
         return new{M}(w./w0)
     end
 end
-SyntheticControlWeights(ws::AbstractVector{T}) where T<:AbstractVector = SyntheticControlWeights(hcat(ws...))
+Weightings(ws::AbstractVector{T}) where T<:AbstractVector = Weightings(hcat(ws...))
 
-@recipe function f(ws::SyntheticControlWeights)
+@recipe function f(ws::Weightings)
     fontfamily --> "Helvetica"
     bar_position --> :stack
     linecolor --> :match
@@ -54,39 +54,39 @@ SyntheticControlWeights(ws::AbstractVector{T}) where T<:AbstractVector = Synthet
     return RecipesBase.recipetype(:groupedbar, W_sorted)
 end
 
-Base.getindex(scw::SyntheticControlWeights, i) = selectdim(scw.w, 2, i)
-function Base.setindex!(scw::SyntheticControlWeights, v, i)
+Base.getindex(scw::Weightings, i) = selectdim(scw.w, 2, i)
+function Base.setindex!(scw::Weightings, v, i)
     selectdim(scw.w, 2, i) .= v
 end
-Base.firstindex(scw::SyntheticControlWeights) = 1
-Base.lastindex(scw::SyntheticControlWeights) = size(scw.w, 2)
-Base.iterate(scw::SyntheticControlWeights, state...) = iterate(eachcol(scw.w), state...)
-Base.length(scw::SyntheticControlWeights) = size(scw.w, 2)
-Base.IteratorEltype(::Type{T}) where T<:SyntheticControlWeights = Base.EltypeUnknown()
+Base.firstindex(scw::Weightings) = 1
+Base.lastindex(scw::Weightings) = size(scw.w, 2)
+Base.iterate(scw::Weightings, state...) = iterate(eachcol(scw.w), state...)
+Base.length(scw::Weightings) = size(scw.w, 2)
+Base.IteratorEltype(::Type{T}) where T<:Weightings = Base.EltypeUnknown()
 
 
-struct SyntheticControlDirichlet{D <: Dirichlet}
+struct _Dirichlet{D <: Dirichlet}
     distribution::D
 end
-Distributions.rand(p::SyntheticControlDirichlet, n::Integer) = SyntheticControlWeights(rand(p.distribution, n))
-Distributions.rand(p::SyntheticControlDirichlet) = rand(p.distribution)
-Distributions.pdf(p::SyntheticControlDirichlet, scw::SyntheticControlWeights) = pdf(p.distribution, scw.w)
-Distributions.logpdf(p::SyntheticControlDirichlet, scw::SyntheticControlWeights) = logpdf(p.distribution, scw.w)
-Distributions.logpdf(p::SyntheticControlDirichlet, w::AbstractVector) = logpdf(p.distribution, w)
-Distributions.insupport(p::SyntheticControlDirichlet, w) = insupport(p.distribution, w)
-Distributions.insupport(p::SyntheticControlDirichlet, scw::SyntheticControlWeights) = insupport(p, scw.w)
-(p::SyntheticControlDirichlet)(scw::SyntheticControlWeights) = pdf(p, scw)
-number_controls(p::SyntheticControlDirichlet) = length(p.distribution)
+Distributions.rand(p::_Dirichlet, n::Integer) = Weightings(rand(p.distribution, n))
+Distributions.rand(p::_Dirichlet) = rand(p.distribution)
+Distributions.pdf(p::_Dirichlet, scw::Weightings) = pdf(p.distribution, scw.w)
+Distributions.logpdf(p::_Dirichlet, scw::Weightings) = logpdf(p.distribution, scw.w)
+Distributions.logpdf(p::_Dirichlet, w::AbstractVector) = logpdf(p.distribution, w)
+Distributions.insupport(p::_Dirichlet, w) = insupport(p.distribution, w)
+Distributions.insupport(p::_Dirichlet, scw::Weightings) = insupport(p, scw.w)
+(p::_Dirichlet)(scw::Weightings) = pdf(p, scw)
+number_controls(p::_Dirichlet) = length(p.distribution)
 
 
-function SyntheticControlPrior(α::AbstractVector)
+function Prior(α::AbstractVector)
     αhat = max_entropy_Dirichlet_parameter(α)
     distribution = Dirichlet(αhat)
-    return SyntheticControlDirichlet(distribution)
+    return _Dirichlet(distribution)
 end
-function SyntheticControlPrior(dim::Integer)
+function Prior(dim::Integer)
     distribution = Dirichlet(dim, 1.0)
-    return SyntheticControlDirichlet(distribution)
+    return _Dirichlet(distribution)
 end
 function max_entropy_objective(α::AbstractVector)
     F = function (λ)
@@ -102,41 +102,40 @@ function max_entropy_Dirichlet_parameter(α::AbstractVector)
     return λ .* α
 end
 
-struct SyntheticControlLogLikelihood{M<:AbstractMatrix, D<:MvNormal}
+struct LogLikelihood{M<:AbstractMatrix, D<:MvNormal}
     X_control::M
     distribution::D
-    function SyntheticControlLogLikelihood(X_control::M, distribution::D) where {M, D}
+    function LogLikelihood(X_control::M, distribution::D) where {M, D}
         d1 = size(X_control, 2)
         d2 = length(distribution)
         d1 == d2 || error("Dimension mismatch: control data is size $(size(X_control)) and intervention data is dimension $(length(distribution)))!")
         return new{M,D}(X_control, distribution)
     end
 end
-SyntheticControlLogLikelihood(X_control, X_intervention, Σ) = SyntheticControlLogLikelihood(X_control, MvNormal(X_intervention, Σ))
-Base.length(ℓ::SyntheticControlLogLikelihood) = length(ℓ.distribution)
-Distributions.mean(ℓ::SyntheticControlLogLikelihood) = mean(ℓ.distribution)
-Distributions.cov(ℓ::SyntheticControlLogLikelihood) = cov(ℓ.distribution)
+LogLikelihood(X_control, X_intervention, Σ) = LogLikelihood(X_control, MvNormal(X_intervention, Σ))
+Base.length(ℓ::LogLikelihood) = length(ℓ.distribution)
+Distributions.mean(ℓ::LogLikelihood) = mean(ℓ.distribution)
+Distributions.cov(ℓ::LogLikelihood) = cov(ℓ.distribution)
 
 function marginal(ℓ, idx)
     μ = mean(ℓ.distribution)
     Σ = cov(ℓ.distribution)
     marginal_distribution = MvNormal(μ[idx], Σ[idx, idx])
-    return SyntheticControlLogLikelihood(selectdim(ℓ.X_control,2,idx), marginal_distribution)
+    return LogLikelihood(selectdim(ℓ.X_control,2,idx), marginal_distribution)
 end
 marginal(ℓ, n::Integer) = marginal(ℓ, 1:n)
-number_controls(ℓ::SyntheticControlLogLikelihood) = size(ℓ.X_control, 1)
-number_covariates(ℓ::SyntheticControlLogLikelihood) = size(ℓ.X_control, 2)
+number_controls(ℓ::LogLikelihood) = size(ℓ.X_control, 1)
+number_covariates(ℓ::LogLikelihood) = size(ℓ.X_control, 2)
 
 
-function (ℓ::SyntheticControlLogLikelihood)(w::AbstractArray)
+function (ℓ::LogLikelihood)(w::AbstractArray)
     X_synthetic = permutedims(ℓ.X_control) * w 
-    # size(X_synthetic) = (dataDimension, numSyntheticControls)
     return logpdf(ℓ.distribution, X_synthetic)
 end
-(ℓ::SyntheticControlLogLikelihood)(ws::SyntheticControlWeights) = ℓ(ws.w)
+(ℓ::LogLikelihood)(ws::Weightings) = ℓ(ws.w)
 
 
-@recipe function f(ws::SyntheticControlWeights, ℓ::SyntheticControlLogLikelihood)
+@recipe function f(ws::Weightings, ℓ::LogLikelihood)
     fontfamily --> "Helvetica"
     dim = length(ℓ.distribution)
     color_palette --> palette(:seaborn_pastel)
@@ -163,10 +162,10 @@ end
 
 
 
-struct SyntheticControlBayesProblem{P<:SyntheticControlDirichlet, L<:SyntheticControlLogLikelihood}
+struct BayesProblem{P<:_Dirichlet, L<:LogLikelihood}
     prior::P
     loglikelihood::L
-    function SyntheticControlBayesProblem(prior::P, loglikelihood::L) where {P, L}
+    function BayesProblem(prior::P, loglikelihood::L) where {P, L}
         number_controls(prior) == number_controls(loglikelihood) || error("number_controls mismatch")
         return new{P, L}(prior, loglikelihood)
     end
@@ -174,19 +173,19 @@ end
 
 
 
-function SyntheticControlProposal(α::AbstractVector; scale=length(α), kwargs...)
+function Proposal(α::AbstractVector; scale=length(α), kwargs...)
     λ = scale / minimum(α)
     distribution = Dirichlet(λ .* α)
-    return SyntheticControlDirichlet(distribution)
+    return _Dirichlet(distribution)
 end
-SyntheticControlProposal(αs::AbstractVector{V}; kwargs...) where V<:AbstractVector = map(α -> SyntheticControlProposal(α; kwargs...), αs)
-SyntheticControlProposal(ws::SyntheticControlWeights; kwargs...) = map(w -> SyntheticControlProposal(w; kwargs...), ws)
+Proposal(αs::AbstractVector{V}; kwargs...) where V<:AbstractVector = map(α -> Proposal(α; kwargs...), αs)
+Proposal(ws::Weightings; kwargs...) = map(w -> Proposal(w; kwargs...), ws)
 
 
-function _mcmc_propose(ws::SyntheticControlWeights; kwargs...)
-    q_forwards = SyntheticControlProposal(ws; kwargs...)
-    proposed_ws = SyntheticControlWeights(rand.(q_forwards))
-    q_backwards = SyntheticControlProposal(proposed_ws; kwargs...)
+function _mcmc_propose(ws::Weightings; kwargs...)
+    q_forwards = Proposal(ws; kwargs...)
+    proposed_ws = Weightings(rand.(q_forwards))
+    q_backwards = Proposal(proposed_ws; kwargs...)
 
     forward_step_logpdf = logpdf.(q_forwards, proposed_ws)
     backward_step_logpdf = logpdf.(q_backwards, ws)
@@ -194,7 +193,7 @@ function _mcmc_propose(ws::SyntheticControlWeights; kwargs...)
     return proposed_ws, forward_step_logpdf, backward_step_logpdf
 end
 
-function _mcmc_sample_step!(ws::SyntheticControlWeights, ℓ::SyntheticControlLogLikelihood, prior::SyntheticControlDirichlet; kwargs...)
+function _mcmc_sample_step!(ws::Weightings, ℓ::LogLikelihood, prior::_Dirichlet; kwargs...)
     proposed_ws, forward_step_logpdf, backward_step_logpdf = _mcmc_propose(ws; kwargs...)
     α = exp.(
         logpdf(prior, proposed_ws)
@@ -235,7 +234,7 @@ function _smc_resample!(synthetic_control_particles, smc_weights)
     return nothing
 end
 
-function Distributions.sample(prob::SyntheticControlBayesProblem, numParticles::Integer, numMCMCIter::Integer; kwargs...)
+function Distributions.sample(prob::BayesProblem, numParticles::Integer, numMCMCIter::Integer; kwargs...)
     numGenerations = length(prob.loglikelihood)
     
     synthetic_control_particles = rand(prob.prior, numParticles)
