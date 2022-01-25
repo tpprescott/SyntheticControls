@@ -163,7 +163,7 @@ end
 
 
 
-struct SyntheticControlBayesProblem{P<:SyntheticControlDirichlet, L<:SyntheticControlLogLikelihood, Tx<:AbstractVector{String}, Tcc<:AbstractVector{String}}
+struct SyntheticControlBayesProblem{P<:SyntheticControlDirichlet, L<:SyntheticControlLogLikelihood}
     prior::P
     loglikelihood::L
     function SyntheticControlBayesProblem(prior::P, loglikelihood::L) where {P, L}
