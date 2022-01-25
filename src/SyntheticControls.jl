@@ -135,6 +135,16 @@ end
 (ℓ::LogLikelihood)(ws::Weightings) = ℓ(ws.w)
 
 
+@recipe function f(ws::Weightings, v::AbstractVector)
+    seriestype --> :density
+    X_synthetic_controls = permutedims(ws.w) * v
+    X_synthetic_controls
+end
+@recipe function f(ws::Weightings, m::AbstractMatrix)
+    seriestype --> :violin
+    X_synthetic_controls = permutedims(ws.w) * m
+    X_synthetic_controls
+end
 @recipe function f(ws::Weightings, ℓ::LogLikelihood)
     fontfamily --> "Helvetica"
     dim = length(ℓ.distribution)
@@ -146,11 +156,9 @@ end
     titlefontsize --> 11
 
     @series begin
-        seriestype --> :violin
         color --> permutedims(collect(1:dim))
         label --> ""
-        X_synthetic_controls = permutedims(ws.w) * ℓ.X_control
-        X_synthetic_controls
+        ws, ℓ.X_control
     end
     color --> :black
     label --> "Intervention unit"
