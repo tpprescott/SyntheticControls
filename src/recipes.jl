@@ -43,7 +43,7 @@ end
 end
 @recipe function f(ws::Weightings, ℓ::LogLikelihood)
     fontfamily --> "Helvetica"
-    dim = length(ℓ.distribution)
+    dim = number_covariates(ℓ)
     color_palette --> palette(:seaborn_pastel)
     xminorticks --> 1
     xlabel --> "Covariate dimension"
@@ -60,7 +60,6 @@ end
     label --> "Intervention unit"
     seriestype --> :scatter
     markersize --> 5
-    μ = mean(ℓ.distribution)
-    μ
+    ℓ.X_intervention
 end
 
