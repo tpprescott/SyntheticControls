@@ -85,23 +85,20 @@ number_controls(ℓ::LogLikelihood) = size(ℓ.X_control, 1)
 number_covariates(ℓ::LogLikelihood) = size(ℓ.X_control, 2)
 
 
-function (ℓ::LogLikelihood)(ws::AbstractMatrix, Ps::AbstractVector{<:AbstractMatrix}, marginal_idx = 1:number_covariates(ℓ))
-    _X_control = selectdim(ℓ.X_control, 2, marginal_idx)
-    _X_intervention = view(ℓ.X_intervention, marginal_idx)
-    centered_X_synthetic = (permutedims(_X_control) * ws) .- _X_intervention
-
+function (ℓ::LogLikelihood)(ws::AbstractMatrix, Ps::AbstractVector{<:AbstractMatrix})
+    centered_X_synthetic = (permutedims(ℓ.X_control) * ws) .- ℓ.X_intervention
     d, c = size(centered_X_synthetic)
     length(Ps)==c || error("Dimension mismatch in number of synthetic controls")
     
     xs = eachcol(centered_X_synthetic)
-    PPs = (view(P, marginal_idx, marginal_idx) for P in Ps)
-    logpdfs = map(zip(xs, PPs)) do (x, PP)
-        ((LinearAlgebra.logdet(PP) - (d*log(2π))) - LinearAlgebra.dot(x,PP,x))/2
+    PPs = Symmetric.(Ps)
+    logpdfs = map(zip(xs, PPs)) do (x, P)
+        ((LinearAlgebra.logdet(P) - (d*log(2π))) - LinearAlgebra.dot(x,P,x))/2
     end
     return logpdfs
 end
-(ℓ::LogLikelihood)(ws::AbstractMatrix, P::AbstractMatrix, marginal_idx...) = ℓ(ws, fill(P, size(ws,2)), marginal_idx...)
-(ℓ::LogLikelihood)(ws::Weightings, Ps_or_P, marginal_idx...) = ℓ(ws.w, Ps_or_P, marginal_idx...)
+(ℓ::LogLikelihood)(ws::AbstractMatrix, P::AbstractMatrix) = ℓ(ws, fill(P, size(ws,2)))
+(ℓ::LogLikelihood)(ws::Weightings, Ps_or_P) = ℓ(ws.w, Ps_or_P)
 
 
 number_covariates(w::Wishart) = size(w,1)
@@ -138,78 +135,43 @@ function _mcmc_propose(ws::Weightings; kwargs...)
     return proposed_ws, forward_step_logpdf, backward_step_logpdf
 end
 
-function _mcmc_sample_step!(
-    (ws, prior_ws)::Tuple{Weightings,_Dirichlet},
-    (Ps, prior_Ps)::Tuple{AbstractVector{<:AbstractMatrix}, Wishart},
-    ℓ;
-    kwargs...
-)
-
-    N = length(ws)
-    u = log.(rand(N, 2))
-    α = zeros(N, 2)
-
-    count_accepted_P = 0
-    count_accepted_w = 0
-
-    # First, propose and accept new precision matrices from the prior
-    proposed_Ps = rand(prior_Ps, N)
-    selectdim(α, 2, 1) .= ℓ(ws, proposed_Ps) .- ℓ(ws, Ps)
-    for i in 1:N
-        if u[i,1] < α[i,1]
-            copy!(Ps[i], proposed_Ps[i])
-            count_accepted_P += 1
-        end
-    end
-
-    # Second, propose and accept new weights
+function _mcmc_sample_step!(ws::Weightings, ℓ::LogLikelihood, prior::_Dirichlet; kwargs...)
     proposed_ws, forward_step_logpdf, backward_step_logpdf = _mcmc_propose(ws; kwargs...)
-    selectdim(α, 2, 2) .= (
-        logpdf(prior_ws, proposed_ws) .- logpdf(prior_ws, ws)
-        .+ ℓ(proposed_ws, Ps) .- ℓ(ws, Ps)
-        .+ backward_step_logpdf .- forward_step_logpdf
+    α = exp.(
+        logpdf(prior, proposed_ws)
+        .- logpdf(prior, ws)
+        .+ ℓ(proposed_ws)
+        .- ℓ(ws)
+        .+ backward_step_logpdf
+        .- forward_step_logpdf
     )
-    for i in 1:N
-        if u[i,2] < α[i,2] 
-            copy!(ws[i], proposed_ws[i])
-            count_accepted_w += 1
-        end
+    u = rand(size(α)...)
+    accept_flags = u .< α
+    for (w, proposed_w, accept_flag) in zip(ws, proposed_ws, accept_flags)
+        accept_flag && (w .= proposed_w)
     end
-
-    return count_accepted_P/N, count_accepted_w/N
+    return mean(accept_flags)
 end
 
-function _mcmc_sample_step!(
-    tup_ws::Tuple{Weightings, _Dirichlet},
-    tup_Ps::Tuple{AbstractVector{<:AbstractMatrix}, Wishart},
-    ℓ,
-    numIter::Integer;
-    progress_meter = Progress(numIter; dt=1),
-    info=(),
-    kwargs...,
-)
-
-    acceptance_rates = map(1:numIter) do _
+function _mcmc_sample_step!(ws, ℓ, prior, numIter::Integer; progress_meter = Progress(numIter; dt=1), info=(), kwargs...)
+    acceptance_rate = map(1:numIter) do _
         ProgressMeter.next!(progress_meter; showvalues=info)
-        _mcmc_sample_step!(tup_ws, tup_Ps, ℓ; kwargs...)
+        _mcmc_sample_step!(ws, ℓ, prior; kwargs...)
     end
-    return acceptance_rates
+    return acceptance_rate
 end
 
-function _update_smc_weighting!(smc_weights, ws, Ps, ℓ_n, ℓ_n_minus_1)
-    smc_weights .*= exp.(ℓ_n(ws, Ps) .- ℓ_n_minus_1(ws, Ps))
+function _update_smc_weighting!(smc_weights, synthetic_control_particles, ℓ_n, ℓ_n_minus_1)
+    smc_weights .*= exp.(ℓ_n(synthetic_control_particles) .- ℓ_n_minus_1(synthetic_control_particles))
     smc_weights ./= sum(smc_weights)
     return nothing
 end
 ESS(smc_weights) = sum(smc_weights)^2 / sum(smc_weights.^2)
 
-function _smc_resample!(ws, Ps, smc_weights)
-    numParticles = length(ws)
+function _smc_resample!(synthetic_control_particles, smc_weights)
+    numParticles = length(synthetic_control_particles)
     idx = rand(Categorical(smc_weights), numParticles)
-    copy!(Ps, Ps[idx])
-    for r in eachrow(ws.w)
-        copy!(r, r[idx])
-    end
+    synthetic_control_particles.w .= synthetic_control_particles.w[:, idx]
     smc_weights .= 1.0/numParticles
     return nothing
 end
@@ -217,30 +179,31 @@ end
 function Distributions.sample(prob::BayesProblem, numParticles::Integer, numMCMCIter::Integer; kwargs...)
     numGenerations = length(prob.loglikelihood)
     
-    ws = rand(prob.prior_ws, numParticles)
-    Ps = rand(prob.prior_Ps, numParticles)
+    synthetic_control_particles = rand(prob.prior, numParticles)
     smc_weights = ones(numParticles)
     smc_weights ./= numParticles
 
-    ℓ_n = (ws, Ps) -> zeros(length(ws))
+    ℓ_n = x -> zeros(length(x))
 
     p = Progress((numMCMCIter+1)*(numGenerations+1); dt=0.2, enabled=true)
-    progress_status(generation, smc_weights) = () -> [(:generation, generation), (:ESS, ESS(smc_weights))]
-    
+    progress_status(generation, smc_weights, acceptance_rates) = () -> [(:generation, generation), (:ESS, ESS(smc_weights)), (:prev_gen_acceptance_rate, mean(acceptance_rates))]
+    progress_status(generation, smc_weights, ::Nothing) = () -> [(:generation, generation), (:ESS, ESS(smc_weights))]
+    acceptance_rates = nothing
+
     for generation in 1:numGenerations
         ℓ_n_minus_1 = ℓ_n
-        ℓ_n = (ws, Ps) -> prob.loglikelihood(ws, Ps, 1:generation)
-        _update_smc_weighting!(smc_weights, ws, Ps, ℓ_n, ℓ_n_minus_1)
-        (ESS(smc_weights) < numParticles/2) && (_smc_resample!(ws, Ps, smc_weights))
-        _ = _mcmc_sample_step!((ws, prob.prior_ws), (Ps, prob.prior_Ps), ℓ_n, numMCMCIter; progress_meter=p, info=progress_status(generation, smc_weights), kwargs...)
-        ProgressMeter.next!(p; showvalues=progress_status(generation, smc_weights))
+        ℓ_n = marginal(prob.loglikelihood, generation)
+        _update_smc_weighting!(smc_weights, synthetic_control_particles, ℓ_n, ℓ_n_minus_1)
+        (ESS(smc_weights) < numParticles/2) && (_smc_resample!(synthetic_control_particles, smc_weights))
+        acceptance_rates = _mcmc_sample_step!(synthetic_control_particles, ℓ_n, prob.prior, numMCMCIter; progress_meter=p, info=progress_status(generation, smc_weights, acceptance_rates), kwargs...)
+        ProgressMeter.next!(p; showvalues=progress_status(generation, smc_weights, acceptance_rates))
         # @info("Generation $(generation) has ESS of $(ESS(smc_weights)) and MCMC acceptance rate of $(mean(acceptance_rates))")
     end
 
-    _smc_resample!(ws, Ps, smc_weights)
-    _ = _mcmc_sample_step!((ws, prob.prior_ws), (Ps, prob.prior_Ps), prob.loglikelihood, numMCMCIter; progress_meter=p, info=progress_status(numGenerations+1, smc_weights), kwargs...)
-    # @info("Final MCMC acceptance rate: $(mean(acceptance_rates))")
-    return ws, Ps
+    _smc_resample!(synthetic_control_particles, smc_weights)
+    acceptance_rates = _mcmc_sample_step!(synthetic_control_particles, prob.loglikelihood, prob.prior, numMCMCIter; progress_meter=p, info=progress_status(numGenerations+1, smc_weights, acceptance_rates), kwargs...)
+    @info("Final MCMC acceptance rate: $(mean(acceptance_rates))")
+    return synthetic_control_particles
 end
 
 include("recipes.jl")
