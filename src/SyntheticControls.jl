@@ -5,6 +5,7 @@ using Optim
 # using StatsBase
 using ProgressMeter
 using StatsPlots, RecipesBase
+using LinearAlgebra
 
 """
     Weightings{M<:AbstractMatrix}
@@ -69,47 +70,46 @@ function max_entropy_Dirichlet_parameter(α::AbstractVector)
     return λ .* α
 end
 
-struct LogLikelihood{M<:AbstractMatrix, D<:MvNormal}
+struct LogLikelihood{M<:AbstractMatrix, V<:AbstractVector}
     X_control::M
-    distribution::D
-    function LogLikelihood(X_control::M, distribution::D) where {M, D}
+    X_intervention::V
+    function LogLikelihood(X_control::M, X_intervention::V) where {M, V}
         d1 = size(X_control, 2)
-        d2 = length(distribution)
-        d1 == d2 || error("Dimension mismatch: control data is size $(size(X_control)) and intervention data is dimension $(length(distribution)))!")
-        return new{M,D}(X_control, distribution)
+        d2 = length(X_intervention)
+        d1 == d2 || error("Dimension mismatch: control has $(d1) and intervention has $(d2) covariates!")
+        return new{M, V}(X_control, X_intervention)
     end
 end
-LogLikelihood(X_control, X_intervention, Σ) = LogLikelihood(X_control, MvNormal(X_intervention, Σ))
-Base.length(ℓ::LogLikelihood) = length(ℓ.distribution)
-Distributions.mean(ℓ::LogLikelihood) = mean(ℓ.distribution)
-Distributions.cov(ℓ::LogLikelihood) = cov(ℓ.distribution)
-
-function marginal(ℓ, idx)
-    μ = mean(ℓ.distribution)
-    Σ = cov(ℓ.distribution)
-    marginal_distribution = MvNormal(μ[idx], Σ[idx, idx])
-    return LogLikelihood(selectdim(ℓ.X_control,2,idx), marginal_distribution)
-end
-marginal(ℓ, n::Integer) = marginal(ℓ, 1:n)
+Base.length(ℓ::LogLikelihood) = length(ℓ.X_intervention)
 number_controls(ℓ::LogLikelihood) = size(ℓ.X_control, 1)
 number_covariates(ℓ::LogLikelihood) = size(ℓ.X_control, 2)
 
 
-function (ℓ::LogLikelihood)(w::AbstractArray)
-    X_synthetic = permutedims(ℓ.X_control) * w 
-    return logpdf(ℓ.distribution, X_synthetic)
+function (ℓ::LogLikelihood)(ws::AbstractMatrix, Ps::AbstractVector{<:AbstractMatrix})
+    centered_X_synthetic = (permutedims(ℓ.X_control) * ws) .- ℓ.X_intervention
+    d, c = size(centered_X_synthetic)
+    length(Ps)==c || error("Dimension mismatch in number of synthetic controls")
+    
+    xs = eachcol(centered_X_synthetic)
+    PPs = Symmetric.(Ps)
+    logpdfs = map(zip(xs, PPs)) do (x, P)
+        ((LinearAlgebra.logdet(P) - (d*log(2π))) - LinearAlgebra.dot(x,P,x))/2
+    end
+    return logpdfs
 end
-(ℓ::LogLikelihood)(ws::Weightings) = ℓ(ws.w)
+(ℓ::LogLikelihood)(ws::AbstractMatrix, P::AbstractMatrix) = ℓ(ws, fill(P, size(ws,2)))
+(ℓ::LogLikelihood)(ws::Weightings, Ps_or_P) = ℓ(ws.w, Ps_or_P)
 
 
-
-
-struct BayesProblem{P<:_Dirichlet, L<:LogLikelihood}
-    prior::P
+number_covariates(w::Wishart) = size(w,1)
+struct BayesProblem{D<:_Dirichlet, W<:Wishart, L<:LogLikelihood}
+    prior_ws::D
+    prior_Ps::W
     loglikelihood::L
-    function BayesProblem(prior::P, loglikelihood::L) where {P, L}
-        number_controls(prior) == number_controls(loglikelihood) || error("number_controls mismatch")
-        return new{P, L}(prior, loglikelihood)
+    function BayesProblem(prior_ws::D, prior_Ps::W, loglikelihood::L) where {D, W, L}
+        number_controls(prior_ws) == number_controls(loglikelihood) || error("number_controls mismatch")
+        number_covariates(prior_Ps) == number_covariates(loglikelihood) || error("number_covariates mismatch")
+        return new{D, W, L}(prior_ws, prior_Ps, loglikelihood)
     end
 end
 
