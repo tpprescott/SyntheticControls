@@ -163,9 +163,8 @@ function SMCProblem(ws::W, smc_logws::V, prior::D, loglikelihood::L, Σ₀::M; h
     return SMCProblem(ws, smc_logws, prior, loglikelihood, Σ₀, dΣ; kwargs...)
 end
 function SMCProblem(ws::W, smc_logws::V, prior::D, loglikelihood::L, dΣ::Float64...; kwargs...) where {W<:Weightings, V<:AbstractVector, D<:_Dirichlet, L<:LogLikelihood} 
-    X_synthetic = permutedims(loglikelihood.X_control)*ws.w
-    Σ₀ = Symmetric(cov(X_synthetic, dims=2))
-    return SMCProblem(ws, smc_logws, prior, loglikelihood, Σ₀, dΣ...; kwargs...)
+    Σ₀ = diagm(var.(eachcol(loglikelihood.X_control)))
+    return SMCProblem(ws, smc_logws, prior, loglikelihood, Diagonal(Σ₀), dΣ...; kwargs...)
 end
 function SMCProblem(N::Integer, prior::D, args...; kwargs...) where {D<:_Dirichlet}
     ws = rand(prior, N)
