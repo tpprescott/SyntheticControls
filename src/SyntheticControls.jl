@@ -85,33 +85,11 @@ number_controls(ℓ::LogLikelihood) = size(ℓ.X_control, 1)
 number_covariates(ℓ::LogLikelihood) = size(ℓ.X_control, 2)
 
 
-function (ℓ::LogLikelihood)(ws::AbstractMatrix, Ps::AbstractVector{<:AbstractMatrix})
-    centered_X_synthetic = (permutedims(ℓ.X_control) * ws) .- ℓ.X_intervention
-    d, c = size(centered_X_synthetic)
-    length(Ps)==c || error("Dimension mismatch in number of synthetic controls")
-    
-    xs = eachcol(centered_X_synthetic)
-    PPs = Symmetric.(Ps)
-    logpdfs = map(zip(xs, PPs)) do (x, P)
-        ((LinearAlgebra.logdet(P) - (d*log(2π))) - LinearAlgebra.dot(x,P,x))/2
-    end
-    return logpdfs
+function (ℓ::LogLikelihood)(ws::AbstractMatrix, Σ)
+    X_synthetic = permutedims(ℓ.X_control) * ws
+    return logpdf(MvNormal(ℓ.X_intervention, Σ), X_synthetic)
 end
-(ℓ::LogLikelihood)(ws::AbstractMatrix, P::AbstractMatrix) = ℓ(ws, fill(P, size(ws,2)))
-(ℓ::LogLikelihood)(ws::Weightings, Ps_or_P) = ℓ(ws.w, Ps_or_P)
-
-
-number_covariates(w::Wishart) = size(w,1)
-struct BayesProblem{D<:_Dirichlet, W<:Wishart, L<:LogLikelihood}
-    prior_ws::D
-    prior_Ps::W
-    loglikelihood::L
-    function BayesProblem(prior_ws::D, prior_Ps::W, loglikelihood::L) where {D, W, L}
-        number_controls(prior_ws) == number_controls(loglikelihood) || error("number_controls mismatch")
-        number_covariates(prior_Ps) == number_covariates(loglikelihood) || error("number_covariates mismatch")
-        return new{D, W, L}(prior_ws, prior_Ps, loglikelihood)
-    end
-end
+(ℓ::LogLikelihood)(ws::Weightings, Σ) = ℓ(ws.w, Σ)
 
 
 
@@ -135,13 +113,13 @@ function _mcmc_propose(ws::Weightings; kwargs...)
     return proposed_ws, forward_step_logpdf, backward_step_logpdf
 end
 
-function _mcmc_sample_step!(ws::Weightings, ℓ::LogLikelihood, prior::_Dirichlet; kwargs...)
+function _mcmc_sample_step!(ws, prior, ℓ_Σ; kwargs...)
     proposed_ws, forward_step_logpdf, backward_step_logpdf = _mcmc_propose(ws; kwargs...)
     α = exp.(
         logpdf(prior, proposed_ws)
         .- logpdf(prior, ws)
-        .+ ℓ(proposed_ws)
-        .- ℓ(ws)
+        .+ ℓ_Σ(proposed_ws)
+        .- ℓ_Σ(ws)
         .+ backward_step_logpdf
         .- forward_step_logpdf
     )
@@ -152,58 +130,107 @@ function _mcmc_sample_step!(ws::Weightings, ℓ::LogLikelihood, prior::_Dirichle
     end
     return mean(accept_flags)
 end
-
-function _mcmc_sample_step!(ws, ℓ, prior, numIter::Integer; progress_meter = Progress(numIter; dt=1), info=(), kwargs...)
+function _mcmc_sample_step!(ws, prior, ℓ_Σ, numIter::Integer; progress_meter = Progress(numIter; dt=1), info=(), kwargs...)
     acceptance_rate = map(1:numIter) do _
         ProgressMeter.next!(progress_meter; showvalues=info)
-        _mcmc_sample_step!(ws, ℓ, prior; kwargs...)
+        _mcmc_sample_step!(ws, prior, ℓ_Σ; kwargs...)
     end
     return acceptance_rate
 end
+_mcmc_sample_step!(ws, prior, ℓ::LogLikelihood, Σ::AbstractMatrix, numIter...; kwargs...) = _mcmc_sample_step!(ws, prior, (_ws) -> ℓ(_ws, Σ), numIter...; kwargs...)
 
-function _update_smc_weighting!(smc_weights, synthetic_control_particles, ℓ_n, ℓ_n_minus_1)
-    smc_weights .*= exp.(ℓ_n(synthetic_control_particles) .- ℓ_n_minus_1(synthetic_control_particles))
-    smc_weights ./= sum(smc_weights)
+
+
+mutable struct SMCProblem{W<:Weightings, V<:AbstractVector, D<:_Dirichlet, L<:LogLikelihood, M<:AbstractMatrix}
+    ws::W
+    smc_logws::V
+    prior::D
+    loglikelihood::L
+    Σ₀::M
+    dΣ::Float64
+    t::Int64
+    function SMCProblem(ws::W, smc_logws::V, prior::D, loglikelihood::L, Σ₀::M, dΣ::Float64; kwargs...) where {W<:Weightings, V<:AbstractVector, D<:_Dirichlet, L<:LogLikelihood, M<:AbstractMatrix}
+        number_controls(prior) == number_controls(loglikelihood) == size(ws.w, 1) || error("number_controls mismatch!")
+        size(Σ₀, 1) == number_covariates(loglikelihood) ||error("number_covariates mismatch!")
+        size(ws.w, 2) == length(smc_logws) || error("number_synthetic_controls mismatch!")
+        isposdef(Σ₀) || error("Σ₀ is not positive definite!")
+        0 < dΣ < 1 || error("Needs dΣ in (0,1)!")
+        return new{W, V, D, L, M}(ws, smc_logws, prior, loglikelihood, Σ₀, dΣ, 0)
+    end
+end
+function SMCProblem(ws::W, smc_logws::V, prior::D, loglikelihood::L, Σ₀::M; halflife::Int64=5, kwargs...) where {W<:Weightings, V<:AbstractVector, D<:_Dirichlet, L<:LogLikelihood, M<:AbstractMatrix} 
+    dΣ = Float64(2^(-1/halflife))
+    return SMCProblem(ws, smc_logws, prior, loglikelihood, Σ₀, dΣ; kwargs...)
+end
+function SMCProblem(ws::W, smc_logws::V, prior::D, loglikelihood::L, dΣ::Float64...; kwargs...) where {W<:Weightings, V<:AbstractVector, D<:_Dirichlet, L<:LogLikelihood} 
+    X_synthetic = permutedims(loglikelihood.X_control)*ws.w
+    Σ₀ = Symmetric(cov(X_synthetic, dims=2))
+    return SMCProblem(ws, smc_logws, prior, loglikelihood, Σ₀, dΣ...; kwargs...)
+end
+function SMCProblem(N::Integer, prior::D, args...; kwargs...) where {D<:_Dirichlet}
+    ws = rand(prior, N)
+    smc_logws = zeros(N)
+    return SMCProblem(ws, smc_logws, prior, args...; kwargs...)
+end
+Base.length(prob::SMCProblem) = length(prob.smc_logws)
+
+
+function _smc_rescale!(prob::SMCProblem)
+    scalor = maximum(prob.smc_logws)
+    prob.smc_logws .-= scalor
     return nothing
 end
-ESS(smc_weights) = sum(smc_weights)^2 / sum(smc_weights.^2)
+function _smc_reweighting!(prob::SMCProblem, ℓₜ, ℓₜ_prev)
+    prob.smc_logws .+= ℓₜ(prob.ws) .- ℓₜ_prev(prob.ws)
+    _smc_rescale!(prob)
+    return nothing
+end
+ESS(smc_ws::AbstractVector) = sum(smc_ws)^2 / sum(smc_ws.^2)
+function ESS(prob::SMCProblem)
+    ess = sum(exp, prob.smc_logws)^2 / sum(w -> exp(2*w), prob.smc_logws)
+    return ess
+end
 
-function _smc_resample!(synthetic_control_particles, smc_weights)
-    numParticles = length(synthetic_control_particles)
-    idx = rand(Categorical(smc_weights), numParticles)
-    synthetic_control_particles.w .= synthetic_control_particles.w[:, idx]
-    smc_weights .= 1.0/numParticles
+function _smc_resample!(prob::SMCProblem)
+    numParticles = length(prob)
+    _smc_rescale!(prob)
+
+    W = exp.(prob.smc_logws)
+    W ./= sum(W)
+    idx = rand(Categorical(W), numParticles)
+
+    copy!(prob.ws.w, prob.ws.w[:, idx])
+    prob.smc_logws .= 0.0
     return nothing
 end
 
-function Distributions.sample(prob::BayesProblem, numParticles::Integer, numMCMCIter::Integer; kwargs...)
-    numGenerations = length(prob.loglikelihood)
+function _smc_step!(prob::SMCProblem, numMCMCIter::Integer, ℓₜ_prev = (W) -> zeros(length(W)); force_resample::Bool=false, kwargs...)
+    Σₜ = ((prob.dΣ)^(prob.t)) .* prob.Σ₀
+    ℓₜ = (W) -> prob.loglikelihood(W, Σₜ)
+
+    _smc_reweighting!(prob, ℓₜ, ℓₜ_prev)
+    (force_resample || ((2.0 * ESS(prob)) < length(prob))) && _smc_resample!(prob)
+    _ = _mcmc_sample_step!(prob.ws, prob.prior, ℓₜ, numMCMCIter; kwargs...)
     
-    synthetic_control_particles = rand(prob.prior, numParticles)
-    smc_weights = ones(numParticles)
-    smc_weights ./= numParticles
+    prob.t += 1
+    return ℓₜ
+end
 
-    ℓ_n = x -> zeros(length(x))
 
-    p = Progress((numMCMCIter+1)*(numGenerations+1); dt=0.2, enabled=true)
-    progress_status(generation, smc_weights, acceptance_rates) = () -> [(:generation, generation), (:ESS, ESS(smc_weights)), (:prev_gen_acceptance_rate, mean(acceptance_rates))]
-    progress_status(generation, smc_weights, ::Nothing) = () -> [(:generation, generation), (:ESS, ESS(smc_weights))]
-    acceptance_rates = nothing
-
-    for generation in 1:numGenerations
-        ℓ_n_minus_1 = ℓ_n
-        ℓ_n = marginal(prob.loglikelihood, generation)
-        _update_smc_weighting!(smc_weights, synthetic_control_particles, ℓ_n, ℓ_n_minus_1)
-        (ESS(smc_weights) < numParticles/2) && (_smc_resample!(synthetic_control_particles, smc_weights))
-        acceptance_rates = _mcmc_sample_step!(synthetic_control_particles, ℓ_n, prob.prior, numMCMCIter; progress_meter=p, info=progress_status(generation, smc_weights, acceptance_rates), kwargs...)
-        ProgressMeter.next!(p; showvalues=progress_status(generation, smc_weights, acceptance_rates))
-        # @info("Generation $(generation) has ESS of $(ESS(smc_weights)) and MCMC acceptance rate of $(mean(acceptance_rates))")
+function Distributions.sample(prob::SMCProblem; numMCMCIter::Integer, numGenerations::Integer, ℓₜ = (ws)->zeros(length(ws)), kwargs...)
+    
+    p = Progress((numMCMCIter+1)*(numGenerations+1); dt=0.5, enabled=true)
+    progress_status(prob) = () -> [(:generation, prob.t), (:ESS, ESS(prob))]
+    
+    while prob.t < numGenerations
+        ℓₜ = _smc_step!(prob, numMCMCIter, ℓₜ; progress_meter=p, info = progress_status(prob))
+        ProgressMeter.next!(p; showvalues=progress_status(prob))
     end
 
-    _smc_resample!(synthetic_control_particles, smc_weights)
-    acceptance_rates = _mcmc_sample_step!(synthetic_control_particles, prob.loglikelihood, prob.prior, numMCMCIter; progress_meter=p, info=progress_status(numGenerations+1, smc_weights, acceptance_rates), kwargs...)
-    @info("Final MCMC acceptance rate: $(mean(acceptance_rates))")
-    return synthetic_control_particles
+    _smc_resample!(prob)
+    _mcmc_sample_step!(prob.ws, prob.prior, ℓₜ, numMCMCIter; progress_meter=p, info=progress_status(prob), kwargs...)
+    
+    return ℓₜ
 end
 
 include("recipes.jl")
