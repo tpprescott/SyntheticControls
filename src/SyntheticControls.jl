@@ -216,9 +216,16 @@ function _smc_step!(prob::SMCProblem, numMCMCIter::Integer, ℓₜ_prev = (W) ->
     return ℓₜ
 end
 
+function _reset!(prob::SMCProblem)
+    prob.t=0
+    N = length(prob)
+    prob.ws = rand(prob.prior, N)
+    prob.smc_logws .= 0.0
+    return nothing
+end
 
-function Distributions.sample(prob::SMCProblem; numMCMCIter::Integer, numGenerations::Integer, ℓₜ = (ws)->zeros(length(ws)), kwargs...)
-    
+function sample!(prob::SMCProblem; numMCMCIter::Integer, numGenerations::Integer, ℓₜ = (ws)->zeros(length(ws)), kwargs...)
+    iszero(prob.t) || _reset!(prob)
     p = Progress((numMCMCIter+1)*(numGenerations+1); dt=0.5, enabled=true)
     progress_status(prob) = () -> [(:generation, prob.t), (:ESS, ESS(prob))]
     
