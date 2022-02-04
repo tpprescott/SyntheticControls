@@ -85,11 +85,32 @@ number_controls(ℓ::LogLikelihood) = size(ℓ.X_control, 1)
 number_covariates(ℓ::LogLikelihood) = size(ℓ.X_control, 2)
 
 
-function (ℓ::LogLikelihood)(ws::AbstractMatrix, Σ)
-    X_synthetic = permutedims(ℓ.X_control) * ws
-    return logpdf(MvNormal(ℓ.X_intervention, Σ), X_synthetic)
+function (ℓ::LogLikelihood)(ws::AbstractMatrix, Σ; α=0, kwargs...)
+    0 <= α <= 1 || error("Specify α in [0,1] - α=0 is minimise synthetic control distance; α=1 is minimise candidate control distance.")
+    S = size(ws, 2)
+    N = number_controls(ℓ)
+    D = number_covariates(ℓ)
+
+    size(ws, 1) == N || error("Mismatched number of candidate controls: size(ws, 1) should be $N")
+    length(Σ) == D || error("Σ should be a length $D vector")
+
+    y = ℓ.X_intervention
+    x = ℓ.X_control
+    
+    L = zeros(S)
+    for s in 1:S
+        for d in 1:D
+            @inbounds sos = y[d]
+            for n in 1:N
+                @inbounds sos -= x[n, d]*ws[n, s]
+                @inbounds L[s] -= α * ws[n, s] *((y[d] - x[n, d]) / Σ[d])^2
+            end
+            @inbounds L[s] -= ((1-α)/2) * (sos/Σ[d])^2
+        end
+    end
+    return L
 end
-(ℓ::LogLikelihood)(ws::Weightings, Σ) = ℓ(ws.w, Σ)
+(ℓ::LogLikelihood)(ws::Weightings, Σ; kwargs...) = ℓ(ws.w, Σ; kwargs...)
 
 
 
@@ -141,30 +162,30 @@ _mcmc_sample_step!(ws, prior, ℓ::LogLikelihood, Σ::AbstractMatrix, numIter...
 
 
 
-mutable struct SMCProblem{W<:Weightings, V<:AbstractVector, D<:_Dirichlet, L<:LogLikelihood, M<:AbstractMatrix}
+mutable struct SMCProblem{W<:Weightings, V1<:AbstractVector, D<:_Dirichlet, L<:LogLikelihood, V2<:AbstractVector}
     ws::W
-    smc_logws::V
+    smc_logws::V1
     prior::D
     loglikelihood::L
-    Σ₀::M
+    Σ₀::V2
     dΣ::Float64
     t::Int64
-    function SMCProblem(ws::W, smc_logws::V, prior::D, loglikelihood::L, Σ₀::M, dΣ::Float64; kwargs...) where {W<:Weightings, V<:AbstractVector, D<:_Dirichlet, L<:LogLikelihood, M<:AbstractMatrix}
+    function SMCProblem(ws::W, smc_logws::V1, prior::D, loglikelihood::L, Σ₀::V2, dΣ::Float64; kwargs...) where {W<:Weightings, V1<:AbstractVector, D<:_Dirichlet, L<:LogLikelihood, V2<:AbstractVector}
         number_controls(prior) == number_controls(loglikelihood) == size(ws.w, 1) || error("number_controls mismatch!")
-        size(Σ₀, 1) == number_covariates(loglikelihood) ||error("number_covariates mismatch!")
+        length(Σ₀) == number_covariates(loglikelihood) ||error("number_covariates mismatch!")
         size(ws.w, 2) == length(smc_logws) || error("number_synthetic_controls mismatch!")
-        isposdef(Σ₀) || error("Σ₀ is not positive definite!")
+        all(>(0), Σ₀) || error("Σ₀ is not positive definite!")
         0 < dΣ < 1 || error("Needs dΣ in (0,1)!")
-        return new{W, V, D, L, M}(ws, smc_logws, prior, loglikelihood, Σ₀, dΣ, 0)
+        return new{W, V1, D, L, V2}(ws, smc_logws, prior, loglikelihood, Σ₀, dΣ, 0)
     end
 end
-function SMCProblem(ws::W, smc_logws::V, prior::D, loglikelihood::L, Σ₀::M; halflife::Int64=5, kwargs...) where {W<:Weightings, V<:AbstractVector, D<:_Dirichlet, L<:LogLikelihood, M<:AbstractMatrix} 
+function SMCProblem(ws::W, smc_logws::V1, prior::D, loglikelihood::L, Σ₀::V2; halflife::Int64=5, kwargs...) where {W<:Weightings, V1<:AbstractVector, D<:_Dirichlet, L<:LogLikelihood, V2<:AbstractVector} 
     dΣ = Float64(2^(-1/halflife))
     return SMCProblem(ws, smc_logws, prior, loglikelihood, Σ₀, dΣ; kwargs...)
 end
-function SMCProblem(ws::W, smc_logws::V, prior::D, loglikelihood::L, dΣ::Float64...; kwargs...) where {W<:Weightings, V<:AbstractVector, D<:_Dirichlet, L<:LogLikelihood} 
-    Σ₀ = diagm(var.(eachcol(loglikelihood.X_control)))
-    return SMCProblem(ws, smc_logws, prior, loglikelihood, Diagonal(Σ₀), dΣ...; kwargs...)
+function SMCProblem(ws::W, smc_logws::V1, prior::D, loglikelihood::L, dΣ::Float64...; kwargs...) where {W<:Weightings, V1<:AbstractVector, D<:_Dirichlet, L<:LogLikelihood} 
+    Σ₀ = std.(eachcol(loglikelihood.X_control))
+    return SMCProblem(ws, smc_logws, prior, loglikelihood, Σ₀, dΣ...; kwargs...)
 end
 function SMCProblem(N::Integer, prior::D, args...; kwargs...) where {D<:_Dirichlet}
     ws = rand(prior, N)
@@ -205,7 +226,7 @@ end
 
 function _smc_step!(prob::SMCProblem, numMCMCIter::Integer, ℓₜ_prev = (W) -> zeros(length(W)); force_resample::Bool=false, kwargs...)
     Σₜ = ((prob.dΣ)^(prob.t)) .* prob.Σ₀
-    ℓₜ = (W) -> prob.loglikelihood(W, Σₜ)
+    ℓₜ = (W) -> prob.loglikelihood(W, Σₜ; kwargs...)
 
     _smc_reweighting!(prob, ℓₜ, ℓₜ_prev)
     (force_resample || ((2.0 * ESS(prob)) < length(prob))) && _smc_resample!(prob)
@@ -229,7 +250,7 @@ function sample!(prob::SMCProblem; numMCMCIter::Integer, numGenerations::Integer
     progress_status(prob) = () -> [(:generation, prob.t), (:ESS, ESS(prob))]
     
     while prob.t < numGenerations
-        ℓₜ = _smc_step!(prob, numMCMCIter, ℓₜ; progress_meter=p, info = progress_status(prob))
+        ℓₜ = _smc_step!(prob, numMCMCIter, ℓₜ; progress_meter=p, info = progress_status(prob), kwargs...)
         ProgressMeter.next!(p; showvalues=progress_status(prob))
     end
 
